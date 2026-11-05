@@ -52,6 +52,21 @@ type RefreshRequest struct {
 	Device       *DeviceRequest `json:"device"`
 }
 
+type ForgotPasswordRequest struct {
+	Email string `json:"email" binding:"required,email,max=255"`
+}
+
+type ResetPasswordRequest struct {
+	Token    string `json:"token" binding:"required,min=16,max=128"`
+	Password string `json:"password" binding:"required,min=8,max=72"`
+}
+
+type DiscordLoginRequest struct {
+	Code        string         `json:"code" binding:"required,min=1,max=512"`
+	RedirectURI string         `json:"redirectUri" binding:"required,url,max=512"`
+	Device      *DeviceRequest `json:"device"`
+}
+
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req RegisterRequest
 
@@ -133,21 +148,28 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		case errors.Is(err, service.ErrInvalidCredentials):
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"status":  "error",
-				"message": "Invalid email or password",
+				"message": i18n.T(c, "auth.invalid_credentials"),
+			})
+			return
+
+		case errors.Is(err, service.ErrAccountLocked):
+			c.JSON(http.StatusForbidden, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.account_locked"),
 			})
 			return
 
 		case errors.Is(err, service.ErrJWTSecretMissing):
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"status":  "error",
-				"message": "Internal server error",
+				"message": i18n.T(c, "common.internal_error"),
 			})
 			return
 
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"status":  "error",
-				"message": "Internal server error",
+				"message": i18n.T(c, "common.internal_error"),
 			})
 			return
 		}
@@ -161,6 +183,66 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			"refreshToken": refreshToken,
 			"tokenType":    "Bearer",
 			"expiresIn":    900, // 15 minutes
+			"user":         user,
+		},
+	})
+}
+
+func (h *AuthHandler) DiscordLogin(c *gin.Context) {
+	var req DiscordLoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "auth.invalid_request")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	accessToken, refreshToken, user, err := h.AuthService.LoginWithDiscord(
+		ctx,
+		req.Code,
+		req.RedirectURI,
+		toDeviceInput(c, req.Device),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrDiscordNotConfigured):
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.discord_not_configured"),
+			})
+		case errors.Is(err, service.ErrDiscordEmailMissing):
+			c.JSON(http.StatusBadRequest, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.discord_email_missing"),
+			})
+		case errors.Is(err, service.ErrDiscordAuthFailed):
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.discord_failed"),
+			})
+		case errors.Is(err, service.ErrEmailExists):
+			c.JSON(http.StatusConflict, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.discord_email_conflict"),
+			})
+		case errors.Is(err, service.ErrJWTSecretMissing):
+			response.InternalServerError(c, "common.internal_error")
+		default:
+			log.Printf("discord login failed: %v", err)
+			response.InternalServerError(c, "common.internal_error")
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": i18n.T(c, "auth.login_success"),
+		"data": gin.H{
+			"accessToken":  accessToken,
+			"refreshToken": refreshToken,
+			"tokenType":    "Bearer",
+			"expiresIn":    900,
 			"user":         user,
 		},
 	})
@@ -264,6 +346,69 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 			"tokenType":    "Bearer",
 			"expiresIn":    900,
 		},
+	})
+}
+
+func (h *AuthHandler) ForgotPassword(c *gin.Context) {
+	var req ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "auth.invalid_request")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	locale, _ := c.Get("locale")
+	localeStr, _ := locale.(string)
+
+	err := h.AuthService.RequestPasswordReset(ctx, req.Email, localeStr)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidInput) {
+			response.BadRequest(c, "auth.invalid_input")
+			return
+		}
+		log.Printf("forgot password failed: %v", err)
+		response.InternalServerError(c, "common.internal_error")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": i18n.T(c, "auth.password_reset_sent"),
+	})
+}
+
+func (h *AuthHandler) ResetPassword(c *gin.Context) {
+	var req ResetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "auth.invalid_request")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	err := h.AuthService.ResetPassword(ctx, req.Token, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidInput):
+			response.BadRequest(c, "auth.invalid_input")
+		case errors.Is(err, service.ErrInvalidResetToken):
+			c.JSON(http.StatusBadRequest, gin.H{
+				"status":  "error",
+				"message": i18n.T(c, "auth.invalid_reset_token"),
+			})
+		default:
+			log.Printf("reset password failed: %v", err)
+			response.InternalServerError(c, "common.internal_error")
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": i18n.T(c, "auth.password_reset_success"),
 	})
 }
 

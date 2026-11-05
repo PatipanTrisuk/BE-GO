@@ -9,7 +9,9 @@ import (
 
 	"go-be/config"
 	"go-be/internal/handler"
+	"go-be/internal/mailer"
 	"go-be/internal/middleware"
+	"go-be/internal/oauth"
 	"go-be/internal/repository"
 	"go-be/internal/service"
 )
@@ -33,25 +35,43 @@ func main() {
 	// Initialize Gin
 	router := gin.Default()
 	router.Use(middleware.LocaleMiddleware())
+	router.Use(middleware.RateLimit(middleware.GlobalRateLimitConfig()))
 
 	// Initialize repositories
 	userRepo := repository.NewUserRepository(db)
 	refreshTokenRepo := repository.NewRefreshTokenRepository(db)
 	deviceRepo := repository.NewDeviceRepository(db)
+	loginAttemptRepo := repository.NewLoginAttemptRepository(db)
+	passwordResetRepo := repository.NewPasswordResetRepository(db)
 
 	// Initialize services
-	authService := service.NewAuthService(userRepo, refreshTokenRepo, deviceRepo)
+	authService := service.NewAuthService(
+		userRepo,
+		refreshTokenRepo,
+		deviceRepo,
+		loginAttemptRepo,
+		passwordResetRepo,
+		mailer.NewFromEnv(),
+		os.Getenv("FRONTEND_URL"),
+		oauth.NewDiscordClient(oauth.DiscordConfigFromEnv()),
+	)
 
 	// Initialize handlers
 	authHandler := handler.NewAuthHandler(authService)
+	adminHandler := handler.NewAdminHandler(userRepo, db)
 	healthHandler := handler.NewHealthHandler(db)
+
+	authRateLimit := middleware.RateLimit(middleware.AuthRateLimitConfig())
 
 	// Auth routes
 	auth := router.Group("/api/auth")
 	{
-		auth.POST("/register", authHandler.Register)
-		auth.POST("/login", authHandler.Login)
-		auth.POST("/refresh", authHandler.Refresh)
+		auth.POST("/register", authRateLimit, authHandler.Register)
+		auth.POST("/login", authRateLimit, authHandler.Login)
+		auth.POST("/discord", authRateLimit, authHandler.DiscordLogin)
+		auth.POST("/refresh", authRateLimit, authHandler.Refresh)
+		auth.POST("/forgot-password", authRateLimit, authHandler.ForgotPassword)
+		auth.POST("/reset-password", authRateLimit, authHandler.ResetPassword)
 		auth.POST("/logout", middleware.AuthMiddleware(os.Getenv("JWT_SECRET")), authHandler.Logout)
 	}
 
@@ -62,6 +82,14 @@ func main() {
 	{
 		protected.GET("/profile", authHandler.GetProfile)
 		protected.GET("/devices", authHandler.ListDevices)
+	}
+
+	// Admin routes
+	admin := router.Group("/api/admin")
+	admin.Use(middleware.AuthMiddleware(os.Getenv("JWT_SECRET")), middleware.RequireAdmin())
+	{
+		admin.GET("/users", adminHandler.ListUsers)
+		admin.GET("/stats", adminHandler.Stats)
 	}
 
 	// Health check

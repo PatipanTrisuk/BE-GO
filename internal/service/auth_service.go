@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"go-be/internal/mailer"
 	"go-be/internal/models"
+	"go-be/internal/oauth"
 	"go-be/internal/repository"
 	"go-be/internal/utils"
 
@@ -26,15 +28,29 @@ var (
 )
 
 var (
-	ErrInvalidCredentials = errors.New("invalid email or password")
-	ErrJWTSecretMissing   = errors.New("JWT secret is missing")
-	ErrUserNotFound       = errors.New("user not found")
+	ErrInvalidCredentials   = errors.New("invalid email or password")
+	ErrAccountLocked        = errors.New("account temporarily locked")
+	ErrJWTSecretMissing     = errors.New("JWT secret is missing")
+	ErrUserNotFound         = errors.New("user not found")
+	ErrInvalidResetToken    = errors.New("invalid or expired reset token")
+	ErrDiscordNotConfigured = oauth.ErrDiscordNotConfigured
+	ErrDiscordEmailMissing  = oauth.ErrDiscordEmailMissing
+	ErrDiscordAuthFailed    = errors.New("discord authentication failed")
 )
 
 type AuthService struct {
-	UserRepo         *repository.UserRepository
-	RefreshTokenRepo *repository.RefreshTokenRepository
-	DeviceRepo       *repository.DeviceRepository
+	UserRepo          *repository.UserRepository
+	RefreshTokenRepo  *repository.RefreshTokenRepository
+	DeviceRepo        *repository.DeviceRepository
+	LoginAttemptRepo  *repository.LoginAttemptRepository
+	PasswordResetRepo *repository.PasswordResetRepository
+	Mailer            PasswordResetMailer
+	FrontendURL       string
+	Discord           *oauth.DiscordClient
+}
+
+type PasswordResetMailer interface {
+	SendPasswordReset(to string, data mailer.PasswordResetEmailData) error
 }
 
 type AccessTokenClaims struct {
@@ -46,11 +62,26 @@ func NewAuthService(
 	userRepo *repository.UserRepository,
 	refreshTokenRepo *repository.RefreshTokenRepository,
 	deviceRepo *repository.DeviceRepository,
+	loginAttemptRepo *repository.LoginAttemptRepository,
+	passwordResetRepo *repository.PasswordResetRepository,
+	mailer PasswordResetMailer,
+	frontendURL string,
+	discord *oauth.DiscordClient,
 ) *AuthService {
+	frontendURL = strings.TrimRight(strings.TrimSpace(frontendURL), "/")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000"
+	}
+
 	return &AuthService{
-		UserRepo:         userRepo,
-		RefreshTokenRepo: refreshTokenRepo,
-		DeviceRepo:       deviceRepo,
+		UserRepo:          userRepo,
+		RefreshTokenRepo:  refreshTokenRepo,
+		DeviceRepo:        deviceRepo,
+		LoginAttemptRepo:  loginAttemptRepo,
+		PasswordResetRepo: passwordResetRepo,
+		Mailer:            mailer,
+		FrontendURL:       frontendURL,
+		Discord:           discord,
 	}
 }
 
@@ -126,14 +157,32 @@ func (s *AuthService) Login(
 	device *DeviceInput,
 ) (string, string, *models.User, error) {
 
-	email = strings.TrimSpace(email)
+	email = strings.ToLower(strings.TrimSpace(email))
+
+	locked, err := s.LoginAttemptRepo.IsLocked(ctx, email)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if locked {
+		return "", "", nil, ErrAccountLocked
+	}
 
 	user, err := s.UserRepo.FindByEmail(ctx, email)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if failErr := s.recordLoginFailure(ctx, email); failErr != nil {
+			return "", "", nil, failErr
+		}
 		return "", "", nil, ErrInvalidCredentials
 	}
 	if err != nil {
 		return "", "", nil, err
+	}
+
+	if strings.TrimSpace(user.Password) == "" {
+		if failErr := s.recordLoginFailure(ctx, email); failErr != nil {
+			return "", "", nil, failErr
+		}
+		return "", "", nil, ErrInvalidCredentials
 	}
 
 	err = bcrypt.CompareHashAndPassword(
@@ -141,7 +190,14 @@ func (s *AuthService) Login(
 		[]byte(password),
 	)
 	if err != nil {
+		if failErr := s.recordLoginFailure(ctx, email); failErr != nil {
+			return "", "", nil, failErr
+		}
 		return "", "", nil, ErrInvalidCredentials
+	}
+
+	if err := s.LoginAttemptRepo.Reset(ctx, email); err != nil {
+		return "", "", nil, err
 	}
 
 	accessToken, err := s.issueAccessToken(user)
@@ -167,6 +223,172 @@ func (s *AuthService) Login(
 	return accessToken, refreshToken, user, nil
 }
 
+func (s *AuthService) recordLoginFailure(ctx context.Context, email string) error {
+	locked, err := s.LoginAttemptRepo.RegisterFailure(ctx, email)
+	if err != nil {
+		return err
+	}
+	if locked {
+		return ErrAccountLocked
+	}
+	return nil
+}
+
+func (s *AuthService) LoginWithDiscord(
+	ctx context.Context,
+	code string,
+	redirectURI string,
+	device *DeviceInput,
+) (string, string, *models.User, error) {
+	if s.Discord == nil {
+		return "", "", nil, ErrDiscordNotConfigured
+	}
+
+	accessToken, err := s.Discord.ExchangeCode(ctx, code, redirectURI)
+	if err != nil {
+		if errors.Is(err, oauth.ErrDiscordNotConfigured) {
+			return "", "", nil, ErrDiscordNotConfigured
+		}
+		return "", "", nil, ErrDiscordAuthFailed
+	}
+
+	discordUser, err := s.Discord.FetchUser(ctx, accessToken)
+	if err != nil {
+		switch {
+		case errors.Is(err, oauth.ErrDiscordEmailMissing):
+			return "", "", nil, ErrDiscordEmailMissing
+		case errors.Is(err, oauth.ErrDiscordNotConfigured):
+			return "", "", nil, ErrDiscordNotConfigured
+		default:
+			return "", "", nil, ErrDiscordAuthFailed
+		}
+	}
+
+	email := strings.ToLower(strings.TrimSpace(discordUser.Email))
+	user, err := s.UserRepo.FindByDiscordID(ctx, discordUser.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		user, err = s.UserRepo.FindByEmail(ctx, email)
+		switch {
+		case err == nil:
+			if user.DiscordID == nil || *user.DiscordID == "" {
+				if linkErr := s.UserRepo.LinkDiscordID(ctx, user.ID.String(), discordUser.ID); linkErr != nil {
+					return "", "", nil, linkErr
+				}
+				id := discordUser.ID
+				user.DiscordID = &id
+			} else if *user.DiscordID != discordUser.ID {
+				return "", "", nil, ErrEmailExists
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			username, genErr := s.uniqueUsername(ctx, discordUser.DisplayName())
+			if genErr != nil {
+				return "", "", nil, genErr
+			}
+			discordID := discordUser.ID
+			user = &models.User{
+				Username:     username,
+				Email:        email,
+				Role:         "user",
+				AuthProvider: "discord",
+				DiscordID:    &discordID,
+			}
+			if createErr := s.UserRepo.Create(ctx, user); createErr != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(createErr, &pgErr) && pgErr.Code == "23505" {
+					switch pgErr.ConstraintName {
+					case "users_email_key":
+						return "", "", nil, ErrEmailExists
+					case "users_username_key":
+						return "", "", nil, ErrUsernameExists
+					case "users_discord_id_key":
+						return "", "", nil, ErrDiscordAuthFailed
+					}
+				}
+				return "", "", nil, createErr
+			}
+		default:
+			return "", "", nil, err
+		}
+	} else if err != nil {
+		return "", "", nil, err
+	}
+
+	issuedAccess, err := s.issueAccessToken(user)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	savedDevice, err := s.upsertDevice(ctx, user.ID.String(), device)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	var deviceID *string
+	if savedDevice != nil {
+		deviceID = &savedDevice.ID
+	}
+
+	refreshToken, err := s.issueRefreshToken(ctx, user.ID.String(), deviceID)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	return issuedAccess, refreshToken, user, nil
+}
+
+func (s *AuthService) uniqueUsername(ctx context.Context, base string) (string, error) {
+	base = sanitizeUsername(base)
+	if len(base) < 3 {
+		base = "discord"
+	}
+	if len(base) > 40 {
+		base = base[:40]
+	}
+
+	candidate := base
+	for i := 0; i < 20; i++ {
+		exists, err := s.UserRepo.UsernameExists(ctx, candidate)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			return candidate, nil
+		}
+
+		suffix, err := generateDeviceKey()
+		if err != nil {
+			return "", err
+		}
+		if len(suffix) > 6 {
+			suffix = suffix[:6]
+		}
+		candidate = base + "_" + suffix
+		if len(candidate) > 50 {
+			candidate = candidate[:50]
+		}
+	}
+
+	return "", ErrUsernameExists
+}
+
+func sanitizeUsername(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '_' || r == '-' || r == '.':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
 func (s *AuthService) GetProfile(
 	ctx context.Context,
 	userId string,
@@ -179,6 +401,108 @@ func (s *AuthService) ListDevices(
 	userID string,
 ) ([]models.Device, error) {
 	return s.DeviceRepo.ListByUserID(ctx, userID)
+}
+
+func (s *AuthService) RequestPasswordReset(
+	ctx context.Context,
+	email string,
+	locale string,
+) error {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || !strings.Contains(email, "@") {
+		return ErrInvalidInput
+	}
+
+	locale = strings.ToLower(strings.TrimSpace(locale))
+	if locale != "th" {
+		locale = "en"
+	}
+
+	user, err := s.UserRepo.FindByEmail(ctx, email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Do not reveal whether the email exists.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	rawToken, err := GenerateRefreshToken()
+	if err != nil {
+		return err
+	}
+
+	if err := s.PasswordResetRepo.InvalidateActiveByUserID(ctx, user.ID.String()); err != nil {
+		return err
+	}
+
+	expiresAt := time.Now().Add(1 * time.Hour)
+	if _, err := s.PasswordResetRepo.Create(
+		ctx,
+		user.ID.String(),
+		utils.HashToken(rawToken),
+		expiresAt,
+	); err != nil {
+		return err
+	}
+
+	resetURL := s.FrontendURL + "/" + locale + "/reset-password?token=" + rawToken
+
+	if s.Mailer == nil {
+		return errors.New("mailer is not configured")
+	}
+
+	expiresIn := "1 hour"
+	if locale == "th" {
+		expiresIn = "1 ชั่วโมง"
+	}
+
+	return s.Mailer.SendPasswordReset(user.Email, mailer.PasswordResetEmailData{
+		Username:  user.Username,
+		ResetURL:  resetURL,
+		ExpiresIn: expiresIn,
+		Locale:    locale,
+	})
+}
+
+func (s *AuthService) ResetPassword(
+	ctx context.Context,
+	token string,
+	password string,
+) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ErrInvalidResetToken
+	}
+	if len(password) < 8 || len(password) > 72 {
+		return ErrInvalidInput
+	}
+
+	resetToken, err := s.PasswordResetRepo.FindValidByHash(ctx, utils.HashToken(token))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrInvalidResetToken
+	}
+	if err != nil {
+		return err
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+
+	if err := s.UserRepo.UpdatePassword(ctx, resetToken.UserID, string(hashedPassword)); err != nil {
+		return err
+	}
+
+	if err := s.PasswordResetRepo.MarkUsed(ctx, resetToken.ID); err != nil {
+		return err
+	}
+
+	_ = s.PasswordResetRepo.InvalidateActiveByUserID(ctx, resetToken.UserID)
+	_ = s.RefreshTokenRepo.RevokeAllByUserID(ctx, resetToken.UserID)
+
+	return nil
 }
 
 func (s *AuthService) Logout(

@@ -70,6 +70,23 @@ func (r *RefreshTokenRepository) Revoke(
 	return err
 }
 
+func (r *RefreshTokenRepository) RevokeAllByUserID(
+	ctx context.Context,
+	userID string,
+) error {
+	_, err := r.DB.Exec(
+		ctx,
+		`
+			UPDATE refresh_tokens
+			SET revoked_at = NOW()
+			WHERE user_id = $1
+			  AND revoked_at IS NULL
+		`,
+		userID,
+	)
+	return err
+}
+
 func (r *RefreshTokenRepository) FindActive(
 	ctx context.Context,
 	tokenHash string,

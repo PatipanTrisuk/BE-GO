@@ -79,3 +79,19 @@ func AuthMiddleware(secret string) gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("role")
+		roleStr, _ := role.(string)
+		if !strings.EqualFold(roleStr, "admin") {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"status":  "error",
+				"message": "Forbidden",
+				"code":    "auth.forbidden",
+			})
+			return
+		}
+		c.Next()
+	}
+}
