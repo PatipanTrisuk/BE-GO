@@ -95,8 +95,8 @@ func DefaultUsers() []UserSeed {
 
 func Users(ctx context.Context, db *pgxpool.Pool, users []UserSeed) error {
 	const query = `
-		INSERT INTO users (username, email, password, role)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO users (username, email, password, role, email_verified_at)
+		VALUES ($1, $2, $3, $4, NOW())
 		ON CONFLICT (email) DO NOTHING
 	`
 

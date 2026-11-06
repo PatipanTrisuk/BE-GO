@@ -56,6 +56,19 @@ func (m *Mailer) SendPasswordReset(to string, data PasswordResetEmailData) error
 	return m.send(to, rendered.Subject, rendered.TextBody, rendered.HTMLBody)
 }
 
+func (m *Mailer) SendEmailVerification(to string, data EmailVerificationData) error {
+	if data.AppName == "" {
+		data.AppName = m.appName
+	}
+
+	rendered, err := renderEmailVerificationEmail(data)
+	if err != nil {
+		return err
+	}
+
+	return m.send(to, rendered.Subject, rendered.TextBody, rendered.HTMLBody)
+}
+
 func (m *Mailer) send(to, subject, textBody, htmlBody string) error {
 	encodedSubject := mime.QEncoding.Encode("UTF-8", subject)
 	boundary := "auth-app-boundary"
