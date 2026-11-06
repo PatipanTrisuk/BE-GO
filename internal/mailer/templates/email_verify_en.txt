@@ -1,0 +1,9 @@
+{{.AppName}} — Verify your email
+
+Hi {{.Username}},
+
+Click the link below to verify your email address. This link expires in {{.ExpiresIn}}.
+
+{{.VerifyURL}}
+
+If you did not create an account, you can ignore this email.

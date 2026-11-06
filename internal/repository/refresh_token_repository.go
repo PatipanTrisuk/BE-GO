@@ -24,6 +24,12 @@ type ActiveRefreshToken struct {
 	DeviceID *string
 }
 
+type RefreshTokenRecord struct {
+	UserID    string
+	DeviceID  *string
+	RevokedAt *time.Time
+}
+
 // Create บันทึก Refresh Token Hash ลง Database
 func (r *RefreshTokenRepository) Create(
 	ctx context.Context,
@@ -109,4 +115,47 @@ func (r *RefreshTokenRepository) FindActive(
 	}
 
 	return &active, nil
+}
+
+func (r *RefreshTokenRepository) FindByHash(
+	ctx context.Context,
+	tokenHash string,
+) (*RefreshTokenRecord, error) {
+	query := `
+		SELECT user_id::text, device_id::text, revoked_at
+		FROM refresh_tokens
+		WHERE token_hash = $1
+	`
+
+	var record RefreshTokenRecord
+	err := r.DB.QueryRow(ctx, query, tokenHash).Scan(
+		&record.UserID,
+		&record.DeviceID,
+		&record.RevokedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &record, nil
+}
+
+func (r *RefreshTokenRepository) RevokeByDeviceID(
+	ctx context.Context,
+	userID string,
+	deviceID string,
+) error {
+	_, err := r.DB.Exec(
+		ctx,
+		`
+			UPDATE refresh_tokens
+			SET revoked_at = NOW()
+			WHERE user_id = $1
+			  AND device_id = $2
+			  AND revoked_at IS NULL
+		`,
+		userID,
+		deviceID,
+	)
+	return err
 }
