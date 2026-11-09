@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"go-be/config"
+	"go-be/internal/authz"
 	"go-be/internal/handler"
 	"go-be/internal/mailer"
 	"go-be/internal/middleware"
@@ -58,6 +59,14 @@ func main() {
 	emailVerificationRepo := repository.NewEmailVerificationRepository(db)
 	exportJobRepo := repository.NewExportJobRepository(db)
 	notificationRepo := repository.NewNotificationRepository(db)
+	roleRepo := repository.NewRoleRepository(db)
+
+	rbacStore := authz.NewStoreWithDefaults()
+	authz.SetStore(rbacStore)
+	roleService := service.NewRoleService(roleRepo, rbacStore)
+	if err := roleService.ReloadStore(context.Background()); err != nil {
+		log.Printf("Warning: failed to load RBAC from database, using defaults: %v", err)
+	}
 
 	// Initialize services
 	authService := service.NewAuthService(
@@ -81,6 +90,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService)
 	notificationHandler := handler.NewNotificationHandler(notificationService)
 	adminHandler := handler.NewAdminHandler(authService, userRepo, exportService, db)
+	roleHandler := handler.NewRoleHandler(roleService)
 	healthHandler := handler.NewHealthHandler(db)
 
 	authRateLimit := middleware.RateLimit(middleware.AuthRateLimitConfig())
@@ -117,23 +127,30 @@ func main() {
 		protected.POST("/notifications/:id/read", notificationHandler.MarkRead)
 	}
 
-	// Admin routes
+	// Admin routes — gated by Role → Permission (see internal/authz)
 	admin := router.Group("/api/admin")
-	admin.Use(authMiddleware, middleware.RequireAdmin())
+	admin.Use(authMiddleware, middleware.RequireAdminArea())
 	{
-		admin.GET("/users", adminHandler.ListUsers)
-		admin.POST("/users/export", adminHandler.ExportUsers)
-		admin.GET("/users/export/jobs/:id", adminHandler.GetExportJob)
-		admin.GET("/users/export/jobs/:id/download", adminHandler.DownloadExportJob)
-		admin.POST("/users", adminHandler.CreateUser)
-		admin.PATCH("/users/:id", adminHandler.UpdateUser)
-		admin.GET("/stats", adminHandler.Stats)
-		admin.DELETE("/users/:id", adminHandler.DeleteUser)
-		admin.POST("/users/:id/restore", adminHandler.RestoreUser)
-		admin.POST("/users/:id/kick", adminHandler.KickUser)
-		admin.POST("/users/:id/reset-password", adminHandler.SetPassword)
-		admin.POST("/users/:id/send-reset-password", adminHandler.SendResetPassword)
-		admin.POST("/users/:id/verify-email", adminHandler.VerifyEmail)
+		admin.GET("/users", middleware.RequirePermission(authz.PermUsersRead), adminHandler.ListUsers)
+		admin.POST("/users/export", middleware.RequirePermission(authz.PermUsersExport), adminHandler.ExportUsers)
+		admin.GET("/users/export/jobs/:id", middleware.RequirePermission(authz.PermUsersExport), adminHandler.GetExportJob)
+		admin.GET("/users/export/jobs/:id/download", middleware.RequirePermission(authz.PermUsersExport), adminHandler.DownloadExportJob)
+		admin.POST("/users", middleware.RequirePermission(authz.PermUsersCreate), adminHandler.CreateUser)
+		admin.PATCH("/users/:id", middleware.RequirePermission(authz.PermUsersUpdate), adminHandler.UpdateUser)
+		admin.GET("/stats", middleware.RequirePermission(authz.PermAdminStats), adminHandler.Stats)
+		admin.DELETE("/users/:id", middleware.RequirePermission(authz.PermUsersDelete), adminHandler.DeleteUser)
+		admin.POST("/users/:id/restore", middleware.RequirePermission(authz.PermUsersRestore), adminHandler.RestoreUser)
+		admin.POST("/users/:id/kick", middleware.RequirePermission(authz.PermUsersKick), adminHandler.KickUser)
+		admin.POST("/users/:id/reset-password", middleware.RequirePermission(authz.PermUsersResetPassword), adminHandler.SetPassword)
+		admin.POST("/users/:id/send-reset-password", middleware.RequirePermission(authz.PermUsersResetPassword), adminHandler.SendResetPassword)
+		admin.POST("/users/:id/verify-email", middleware.RequirePermission(authz.PermUsersVerifyEmail), adminHandler.VerifyEmail)
+
+		admin.GET("/permissions", middleware.RequirePermission(authz.PermRolesRead), roleHandler.ListPermissions)
+		admin.GET("/roles", middleware.RequireAnyPermission(authz.PermRolesRead, authz.PermUsersRead, authz.PermUsersCreate, authz.PermUsersUpdate), roleHandler.ListRoles)
+		admin.GET("/roles/:id", middleware.RequirePermission(authz.PermRolesRead), roleHandler.GetRole)
+		admin.POST("/roles", middleware.RequirePermission(authz.PermRolesCreate), roleHandler.CreateRole)
+		admin.PATCH("/roles/:id", middleware.RequirePermission(authz.PermRolesUpdate), roleHandler.UpdateRole)
+		admin.DELETE("/roles/:id", middleware.RequirePermission(authz.PermRolesDelete), roleHandler.DeleteRole)
 	}
 
 	// Health check

@@ -25,6 +25,12 @@ func DefaultUsers() []UserSeed {
 			Role:     "admin",
 		},
 		{
+			Username: "moderator",
+			Email:    "moderator@example.com",
+			Password: "Moderator123!",
+			Role:     "moderator",
+		},
+		{
 			Username: "alice",
 			Email:    "alice@example.com",
 			Password: "Password123!",
@@ -95,8 +101,14 @@ func DefaultUsers() []UserSeed {
 
 func Users(ctx context.Context, db *pgxpool.Pool, users []UserSeed) error {
 	const query = `
-		INSERT INTO users (username, email, password, role, email_verified_at)
-		VALUES ($1, $2, $3, $4, NOW())
+		INSERT INTO users (username, email, password, role_id, email_verified_at)
+		VALUES (
+			$1,
+			$2,
+			$3,
+			(SELECT id FROM roles WHERE LOWER(name) = LOWER($4) LIMIT 1),
+			NOW()
+		)
 		ON CONFLICT (email) DO NOTHING
 	`
 

@@ -6,10 +6,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
 
+	"go-be/internal/authz"
 	"go-be/internal/mailer"
 	"go-be/internal/models"
 	"go-be/internal/repository"
@@ -17,10 +19,10 @@ import (
 )
 
 var (
-	ErrCannotTargetSelf  = errors.New("cannot perform this action on yourself")
-	ErrEmailVerified     = errors.New("email already verified")
+	ErrCannotTargetSelf   = errors.New("cannot perform this action on yourself")
+	ErrEmailVerified      = errors.New("email already verified")
 	ErrUserAlreadyDeleted = errors.New("user already deleted")
-	ErrUserNotDeleted    = errors.New("user is not deleted")
+	ErrUserNotDeleted     = errors.New("user is not deleted")
 )
 
 func (s *AuthService) AdminGetUser(ctx context.Context, userID string) (*models.User, error) {
@@ -34,24 +36,54 @@ func (s *AuthService) AdminGetUser(ctx context.Context, userID string) (*models.
 type AdminUserInput struct {
 	Username string
 	Email    string
-	Role     string
+	RoleID   string
+}
+
+func (s *AuthService) resolveRoleID(ctx context.Context, roleIDOrName string) (uuid.UUID, string, error) {
+	roleIDOrName = strings.TrimSpace(roleIDOrName)
+	if roleIDOrName == "" {
+		roleIDOrName = authz.RoleUser
+	}
+
+	if id, err := uuid.Parse(roleIDOrName); err == nil {
+		name, err := s.roleNameByID(ctx, id)
+		if err != nil {
+			return uuid.Nil, "", ErrInvalidInput
+		}
+		if !authz.IsValidRole(id.String()) && !authz.IsValidRole(name) {
+			return uuid.Nil, "", ErrInvalidInput
+		}
+		return id, name, nil
+	}
+
+	id, err := s.UserRepo.FindRoleIDByName(ctx, roleIDOrName)
+	if err != nil {
+		return uuid.Nil, "", ErrInvalidInput
+	}
+	if !authz.IsValidRole(id.String()) && !authz.IsValidRole(roleIDOrName) {
+		return uuid.Nil, "", ErrInvalidInput
+	}
+	return id, authz.NormalizeRole(roleIDOrName), nil
+}
+
+func (s *AuthService) roleNameByID(ctx context.Context, id uuid.UUID) (string, error) {
+	var name string
+	err := s.UserRepo.DB.QueryRow(ctx, `SELECT name FROM roles WHERE id = $1`, id).Scan(&name)
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func normalizeAdminUserInput(input AdminUserInput) (AdminUserInput, error) {
 	input.Username = strings.TrimSpace(input.Username)
 	input.Email = strings.ToLower(strings.TrimSpace(input.Email))
-	input.Role = strings.ToLower(strings.TrimSpace(input.Role))
-	if input.Role == "" {
-		input.Role = "user"
-	}
+	input.RoleID = strings.TrimSpace(input.RoleID)
 
 	if len(input.Username) < 3 || len(input.Username) > 50 {
 		return input, ErrInvalidInput
 	}
 	if len(input.Email) == 0 || len(input.Email) > 255 || !strings.Contains(input.Email, "@") {
-		return input, ErrInvalidInput
-	}
-	if input.Role != "user" && input.Role != "admin" {
 		return input, ErrInvalidInput
 	}
 	return input, nil
@@ -76,10 +108,16 @@ func (s *AuthService) AdminCreateUser(ctx context.Context, input AdminUserInput)
 		return nil, err
 	}
 
+	roleID, roleName, err := s.resolveRoleID(ctx, input.RoleID)
+	if err != nil {
+		return nil, err
+	}
+
 	user := &models.User{
 		Username:     input.Username,
 		Email:        input.Email,
-		Role:         input.Role,
+		RoleID:       roleID,
+		Role:         roleName,
 		AuthProvider: "local",
 	}
 
@@ -101,15 +139,22 @@ func (s *AuthService) AdminUpdateUser(ctx context.Context, actorID, targetID str
 		return nil, err
 	}
 
+	roleID, roleName, err := s.resolveRoleID(ctx, input.RoleID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Prevent an admin from removing their own admin role.
-	if strings.EqualFold(actorID, targetID) && existing.Role == "admin" && input.Role != "admin" {
+	if strings.EqualFold(actorID, targetID) &&
+		authz.NormalizeRole(existing.Role) == authz.RoleAdmin &&
+		authz.NormalizeRole(roleName) != authz.RoleAdmin {
 		return nil, ErrCannotTargetSelf
 	}
 
 	if err := s.UserRepo.UpdateProfile(ctx, targetID, repository.UserProfileUpdate{
 		Username: input.Username,
 		Email:    input.Email,
-		Role:     input.Role,
+		RoleID:   roleID.String(),
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound

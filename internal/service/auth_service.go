@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"go-be/internal/authz"
 	"go-be/internal/mailer"
 	"go-be/internal/models"
 	"go-be/internal/oauth"
@@ -64,7 +65,8 @@ type AuthMailer interface {
 }
 
 type AccessTokenClaims struct {
-	Role string `json:"role"`
+	RoleID string `json:"role_id"`
+	Role   string `json:"role"`
 	jwt.RegisteredClaims
 }
 
@@ -135,11 +137,17 @@ func (s *AuthService) Register(
 		return nil, err
 	}
 
+	roleID, err := s.UserRepo.FindRoleIDByName(ctx, authz.RoleUser)
+	if err != nil {
+		return nil, err
+	}
+
 	user := &models.User{
 		Username: input.Username,
 		Email:    input.Email,
 		Password: string(hashedPassword),
-		Role:     "user",
+		RoleID:   roleID,
+		Role:     authz.RoleUser,
 	}
 
 	err = s.UserRepo.Create(ctx, user)
@@ -253,6 +261,7 @@ func (s *AuthService) Login(
 		return "", "", nil, err
 	}
 
+	authz.AttachPermissions(user)
 	return accessToken, refreshToken, user, nil
 }
 
@@ -319,10 +328,15 @@ func (s *AuthService) LoginWithDiscord(
 			}
 			discordID := discordUser.ID
 			now := time.Now()
+			roleID, roleErr := s.UserRepo.FindRoleIDByName(ctx, authz.RoleUser)
+			if roleErr != nil {
+				return "", "", nil, roleErr
+			}
 			user = &models.User{
 				Username:        username,
 				Email:           email,
-				Role:            "user",
+				RoleID:          roleID,
+				Role:            authz.RoleUser,
 				AuthProvider:    "discord",
 				DiscordID:       &discordID,
 				EmailVerifiedAt: &now,
@@ -368,6 +382,7 @@ func (s *AuthService) LoginWithDiscord(
 		return "", "", nil, err
 	}
 
+	authz.AttachPermissions(user)
 	return issuedAccess, refreshToken, user, nil
 }
 
@@ -428,7 +443,12 @@ func (s *AuthService) GetProfile(
 	ctx context.Context,
 	userId string,
 ) (*models.User, error) {
-	return s.UserRepo.FindByID(ctx, userId)
+	user, err := s.UserRepo.FindByID(ctx, userId)
+	if err != nil {
+		return nil, err
+	}
+	authz.AttachPermissions(user)
+	return user, nil
 }
 
 func (s *AuthService) ListDevices(
@@ -835,7 +855,8 @@ func (s *AuthService) issueAccessToken(user *models.User) (string, error) {
 
 	now := time.Now()
 	claims := AccessTokenClaims{
-		Role: user.Role,
+		RoleID: user.RoleID.String(),
+		Role:   user.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
 			IssuedAt:  jwt.NewNumericDate(now),
