@@ -265,13 +265,13 @@ type adminSetPasswordRequest struct {
 type adminCreateUserRequest struct {
 	Username string `json:"username" binding:"required,min=3,max=50"`
 	Email    string `json:"email" binding:"required,email,max=255"`
-	Role     string `json:"role" binding:"omitempty,oneof=user admin"`
+	RoleID   string `json:"role_id" binding:"omitempty,uuid"`
 }
 
 type adminUpdateUserRequest struct {
 	Username string `json:"username" binding:"required,min=3,max=50"`
 	Email    string `json:"email" binding:"required,email,max=255"`
-	Role     string `json:"role" binding:"required,oneof=user admin"`
+	RoleID   string `json:"role_id" binding:"required,uuid"`
 }
 
 func (h *AdminHandler) CreateUser(c *gin.Context) {
@@ -291,7 +291,7 @@ func (h *AdminHandler) CreateUser(c *gin.Context) {
 	user, err := h.AuthService.AdminCreateUser(ctx, service.AdminUserInput{
 		Username: req.Username,
 		Email:    req.Email,
-		Role:     req.Role, // empty → service defaults to "user"
+		RoleID:   req.RoleID, // empty → service defaults to "user" role
 	})
 	if err != nil {
 		h.writeAdminError(c, err)
@@ -322,7 +322,7 @@ func (h *AdminHandler) UpdateUser(c *gin.Context) {
 	user, err := h.AuthService.AdminUpdateUser(ctx, actorID(c), c.Param("id"), service.AdminUserInput{
 		Username: req.Username,
 		Email:    req.Email,
-		Role:     req.Role,
+		RoleID:   req.RoleID,
 	})
 	if err != nil {
 		h.writeAdminError(c, err)

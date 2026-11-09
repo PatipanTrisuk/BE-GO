@@ -11,7 +11,9 @@ type User struct {
 	Username        string     `json:"username"`
 	Email           string     `json:"email"`
 	Password        string     `json:"-"`
-	Role            string     `json:"role"`
+	RoleID          uuid.UUID  `json:"role_id"`
+	Role            string     `json:"role"` // role name (joined), for display
+	Permissions     []string   `json:"permissions,omitempty"`
 	AuthProvider    string     `json:"auth_provider"`
 	DiscordID       *string    `json:"discord_id,omitempty"`
 	EmailVerifiedAt *time.Time `json:"email_verified_at,omitempty"`

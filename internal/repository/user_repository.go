@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -45,6 +46,7 @@ func scanUser(
 		dest = append(dest, &password)
 	}
 	dest = append(dest,
+		&user.RoleID,
 		&user.Role,
 		&user.AuthProvider,
 		&discordID,
@@ -80,30 +82,37 @@ func scanUser(
 }
 
 const userSelectWithPassword = `
-	id,
-	username,
-	email,
-	password,
-	role,
-	auth_provider,
-	discord_id,
-	email_verified_at,
-	deleted_at,
-	created_at,
-	updated_at
+	u.id,
+	u.username,
+	u.email,
+	u.password,
+	u.role_id,
+	r.name AS role,
+	u.auth_provider,
+	u.discord_id,
+	u.email_verified_at,
+	u.deleted_at,
+	u.created_at,
+	u.updated_at
 `
 
 const userSelectPublic = `
-	id,
-	username,
-	email,
-	role,
-	auth_provider,
-	discord_id,
-	email_verified_at,
-	deleted_at,
-	created_at,
-	updated_at
+	u.id,
+	u.username,
+	u.email,
+	u.role_id,
+	r.name AS role,
+	u.auth_provider,
+	u.discord_id,
+	u.email_verified_at,
+	u.deleted_at,
+	u.created_at,
+	u.updated_at
+`
+
+const userFromJoin = `
+	FROM users u
+	JOIN roles r ON r.id = u.role_id
 `
 
 // Create User
@@ -116,7 +125,7 @@ func (r *UserRepository) Create(
 	}
 
 	query := `
-		INSERT INTO users (username, email, password, role, auth_provider, discord_id, email_verified_at)
+		INSERT INTO users (username, email, password, role_id, auth_provider, discord_id, email_verified_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id, created_at, updated_at
 	`
@@ -144,7 +153,7 @@ func (r *UserRepository) Create(
 		user.Username,
 		user.Email,
 		password,
-		user.Role,
+		user.RoleID,
 		user.AuthProvider,
 		discordID,
 		emailVerifiedAt,
@@ -162,8 +171,8 @@ func (r *UserRepository) FindByEmail(
 
 	query := `
         SELECT ` + userSelectWithPassword + `
-        FROM users
-        WHERE email = $1 AND deleted_at IS NULL
+        ` + userFromJoin + `
+        WHERE u.email = $1 AND u.deleted_at IS NULL
     `
 
 	err := scanUser(r.DB.QueryRow(ctx, query, email), user, true)
@@ -181,8 +190,8 @@ func (r *UserRepository) FindByDiscordID(
 
 	query := `
         SELECT ` + userSelectWithPassword + `
-        FROM users
-        WHERE discord_id = $1 AND deleted_at IS NULL
+        ` + userFromJoin + `
+        WHERE u.discord_id = $1 AND u.deleted_at IS NULL
     `
 
 	err := scanUser(r.DB.QueryRow(ctx, query, discordID), user, true)
@@ -201,8 +210,8 @@ func (r *UserRepository) FindByID(
 
 	query := `
         SELECT ` + userSelectWithPassword + `
-        FROM users
-        WHERE id = $1 AND deleted_at IS NULL
+        ` + userFromJoin + `
+        WHERE u.id = $1 AND u.deleted_at IS NULL
     `
 
 	err := scanUser(r.DB.QueryRow(ctx, query, id), user, true)
@@ -220,8 +229,8 @@ func (r *UserRepository) FindByIDAny(
 
 	query := `
         SELECT ` + userSelectWithPassword + `
-        FROM users
-        WHERE id = $1
+        ` + userFromJoin + `
+        WHERE u.id = $1
     `
 
 	err := scanUser(r.DB.QueryRow(ctx, query, id), user, true)
@@ -277,19 +286,19 @@ type ListParams struct {
 }
 
 var userSortColumns = map[string]string{
-	"username":          "username",
-	"email":             "email",
-	"role":              "role",
-	"auth_provider":     "auth_provider",
-	"email_verified_at": "email_verified_at",
-	"created_at":        "created_at",
-	"updated_at":        "updated_at",
+	"username":          "u.username",
+	"email":             "u.email",
+	"role":              "r.name",
+	"auth_provider":     "u.auth_provider",
+	"email_verified_at": "u.email_verified_at",
+	"created_at":        "u.created_at",
+	"updated_at":        "u.updated_at",
 }
 
 func orderByClause(sortBy, sortDir string) string {
 	column, ok := userSortColumns[strings.ToLower(strings.TrimSpace(sortBy))]
 	if !ok {
-		column = "created_at"
+		column = "u.created_at"
 	}
 	dir := "DESC"
 	switch strings.ToLower(strings.TrimSpace(sortDir)) {
@@ -298,7 +307,7 @@ func orderByClause(sortBy, sortDir string) string {
 	case "desc", "descending":
 		dir = "DESC"
 	}
-	return " ORDER BY " + column + " " + dir + ", id ASC"
+	return " ORDER BY " + column + " " + dir + ", u.id ASC"
 }
 
 func appendUserListFilters(params ListParams, args []any) (string, []any) {
@@ -306,46 +315,47 @@ func appendUserListFilters(params ListParams, args []any) (string, []any) {
 
 	switch strings.ToLower(strings.TrimSpace(params.DeletedStatus)) {
 	case "deleted":
-		clauses = append(clauses, "deleted_at IS NOT NULL")
+		clauses = append(clauses, "u.deleted_at IS NOT NULL")
 	case "all":
 		// no deleted_at filter
 	default:
-		clauses = append(clauses, "deleted_at IS NULL")
+		clauses = append(clauses, "u.deleted_at IS NULL")
 	}
 
 	search := strings.TrimSpace(params.Query)
 	if search != "" {
 		args = append(args, "%"+search+"%")
-		clauses = append(clauses, fmt.Sprintf("(email ILIKE $%d OR username ILIKE $%d)", len(args), len(args)))
+		clauses = append(clauses, fmt.Sprintf("(u.email ILIKE $%d OR u.username ILIKE $%d)", len(args), len(args)))
 	}
 
-	role := strings.ToLower(strings.TrimSpace(params.Role))
+	role := strings.TrimSpace(params.Role)
 	if role != "" {
 		args = append(args, role)
-		clauses = append(clauses, fmt.Sprintf("LOWER(role) = $%d", len(args)))
+		// Accept role UUID or role name.
+		clauses = append(clauses, fmt.Sprintf("(u.role_id::text = $%d OR LOWER(r.name) = LOWER($%d))", len(args), len(args)))
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(params.AuthProvider))
 	if provider != "" {
 		args = append(args, provider)
-		clauses = append(clauses, fmt.Sprintf("LOWER(auth_provider) = $%d", len(args)))
+		clauses = append(clauses, fmt.Sprintf("LOWER(u.auth_provider) = $%d", len(args)))
 	}
 
 	if params.CreatedFrom != nil {
 		args = append(args, *params.CreatedFrom)
-		clauses = append(clauses, fmt.Sprintf("created_at >= $%d", len(args)))
+		clauses = append(clauses, fmt.Sprintf("u.created_at >= $%d", len(args)))
 	}
 	if params.CreatedTo != nil {
 		args = append(args, *params.CreatedTo)
-		clauses = append(clauses, fmt.Sprintf("created_at <= $%d", len(args)))
+		clauses = append(clauses, fmt.Sprintf("u.created_at <= $%d", len(args)))
 	}
 	if params.UpdatedFrom != nil {
 		args = append(args, *params.UpdatedFrom)
-		clauses = append(clauses, fmt.Sprintf("updated_at >= $%d", len(args)))
+		clauses = append(clauses, fmt.Sprintf("u.updated_at >= $%d", len(args)))
 	}
 	if params.UpdatedTo != nil {
 		args = append(args, *params.UpdatedTo)
-		clauses = append(clauses, fmt.Sprintf("updated_at <= $%d", len(args)))
+		clauses = append(clauses, fmt.Sprintf("u.updated_at <= $%d", len(args)))
 	}
 
 	where := ""
@@ -373,7 +383,7 @@ func (r *UserRepository) List(ctx context.Context, params ListParams) ([]models.
 
 	query := `
         SELECT ` + userSelectPublic + `
-        FROM users` + where + orderByClause(params.SortBy, params.SortDir) + `
+        ` + userFromJoin + where + orderByClause(params.SortBy, params.SortDir) + `
         LIMIT $` + strconv.Itoa(limitIdx) + ` OFFSET $` + strconv.Itoa(offsetIdx)
 
 	rows, err := r.DB.Query(ctx, query, args...)
@@ -401,14 +411,14 @@ func (r *UserRepository) List(ctx context.Context, params ListParams) ([]models.
 func (r *UserRepository) Count(ctx context.Context, params ListParams) (int, error) {
 	where, args := appendUserListFilters(params, nil)
 	var count int
-	err := r.DB.QueryRow(ctx, `SELECT COUNT(*) FROM users`+where, args...).Scan(&count)
+	err := r.DB.QueryRow(ctx, `SELECT COUNT(*) `+userFromJoin+where, args...).Scan(&count)
 	return count, err
 }
 
 type UserProfileUpdate struct {
 	Username string
 	Email    string
-	Role     string
+	RoleID   string
 }
 
 func (r *UserRepository) UpdateProfile(ctx context.Context, userID string, input UserProfileUpdate) error {
@@ -418,14 +428,14 @@ func (r *UserRepository) UpdateProfile(ctx context.Context, userID string, input
 			UPDATE users
 			SET username = $2,
 			    email = $3,
-			    role = $4,
+			    role_id = $4,
 			    updated_at = NOW()
 			WHERE id = $1 AND deleted_at IS NULL
 		`,
 		userID,
 		input.Username,
 		input.Email,
-		input.Role,
+		input.RoleID,
 	)
 	if err != nil {
 		return err
@@ -534,11 +544,19 @@ func (r *UserRepository) Restore(ctx context.Context, userID string) error {
 	return nil
 }
 
+func (r *UserRepository) FindRoleIDByName(ctx context.Context, name string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := r.DB.QueryRow(ctx, `
+		SELECT id FROM roles WHERE LOWER(name) = LOWER($1) LIMIT 1
+	`, strings.TrimSpace(name)).Scan(&id)
+	return id, err
+}
+
 func (r *UserRepository) ListAll(ctx context.Context, params ListParams) ([]models.User, error) {
 	where, args := appendUserListFilters(params, nil)
 	query := `
         SELECT ` + userSelectPublic + `
-        FROM users` + where + orderByClause(params.SortBy, params.SortDir)
+        ` + userFromJoin + where + orderByClause(params.SortBy, params.SortDir)
 
 	rows, err := r.DB.Query(ctx, query, args...)
 	if err != nil {
